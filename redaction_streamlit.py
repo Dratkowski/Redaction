@@ -1,7 +1,3 @@
-# Requirements:
-# pip install streamlit python-docx pymupdf spacy
-# python -m spacy download en_core_web_sm
-
 import streamlit as st
 import os
 import re
@@ -102,7 +98,7 @@ def redact_pdf(file, approved):
     doc.close()
     return buffer
 
-st.title("PII Redactor")
+st.title("PII Redactor with Auto-Select")
 
 uploaded_file = st.file_uploader("Upload PDF or DOCX", type=['pdf', 'docx'])
 
@@ -110,7 +106,8 @@ if uploaded_file:
     text, page_texts = extract_text(uploaded_file)
     regex_pii = find_regex_pii(text, page_texts)
     ner_pii = find_ner_pii(text, page_texts)
-    
+
+    # Merge regex and NER PII
     pii_groups = {}
     all_types = set(list(regex_pii.keys()) + list(ner_pii.keys()))
     for t in all_types:
@@ -125,18 +122,23 @@ if uploaded_file:
                 else:
                     pii_groups[t][vk] = vv
 
-    st.header("Select PII to Redact")
+    st.header("Select PII to Redact (All occurrences auto-selected)")
     approved = []
+    check_states = {}
+
     for pii_type, values in pii_groups.items():
         with st.expander(pii_type):
             for value, contexts in values.items():
-                display_text = f"{value} | Context: {contexts[0][0]} (Page {contexts[0][1]})"
-                if st.checkbox(display_text, key=f"{pii_type}_{value}"):
+                # Create a single string of all contexts for display
+                context_text = " | ".join([f"{ctx} (Page {pg})" for ctx, pg in contexts])
+                check_states[value] = st.checkbox(f"{value} → {context_text}", key=value)
+                if check_states[value]:
                     approved.append(value)
 
     if st.button("Apply Redactions"):
         ext = os.path.splitext(uploaded_file.name)[1].lower()
         if ext == '.pdf':
+            uploaded_file.seek(0)
             redacted_file = redact_pdf(uploaded_file, approved)
             st.download_button("Download Redacted PDF", redacted_file, file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_redacted.pdf")
         elif ext == '.docx':
