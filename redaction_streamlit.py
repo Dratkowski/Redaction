@@ -1,14 +1,26 @@
+# Requirements:
+# pip install streamlit python-docx pymupdf spacy
+# python -m spacy download en_core_web_sm
+
 import streamlit as st
 import os
 import re
 from collections import defaultdict
-import fitz  # PyMuPDF
+from io import BytesIO
 from docx import Document
 import spacy
-from io import BytesIO
 
 # Load spaCy model
 nlp = spacy.load("en_core_web_sm")
+
+# Try importing PyMuPDF
+try:
+    import fitz  # PyMuPDF
+    pdf_enabled = True
+except ImportError:
+    fitz = None
+    pdf_enabled = False
+    st.warning("PyMuPDF not installed. PDF files will not be supported. Install with `pip install PyMuPDF`.")
 
 # Regex patterns for PII
 patterns = {
@@ -22,9 +34,13 @@ patterns = {
     'DRIVER_LICENSE': r'(?:\b[A-Z]{1,2}\d{3}-\d{3}-\d{2}-\d{3}-\d{1,2}\b)|(?:\b\d{7,9}\b)'
 }
 
+# --- Text extraction ---
 def extract_text(file):
     ext = os.path.splitext(file.name)[1].lower()
     if ext == '.pdf':
+        if not pdf_enabled:
+            st.error("PDF processing is disabled because PyMuPDF is not installed.")
+            return None, None
         doc = fitz.open(stream=file.read(), filetype="pdf")
         page_texts = [(page.get_text(), page.number + 1) for page in doc]
         full_text = "\n".join(text for text, _ in page_texts)
@@ -39,6 +55,7 @@ def extract_text(file):
         st.error("Unsupported file type")
         return None, None
 
+# --- Context extraction ---
 def get_context(text, start, end, pii_value, page_texts):
     page_number = 1
     char_offset = 0
@@ -52,6 +69,7 @@ def get_context(text, start, end, pii_value, page_texts):
     context = ' '.join(before_words) + ' ' + pii_value + ' ' + ' '.join(after_words)
     return context, page_number
 
+# --- Regex PII ---
 def find_regex_pii(text, page_texts):
     pii = defaultdict(lambda: defaultdict(list))
     for pii_type, pattern in patterns.items():
@@ -62,6 +80,7 @@ def find_regex_pii(text, page_texts):
             pii[pii_type][value].append((context, page_number))
     return {k: {vk: list(set(vv)) for vk, vv in v.items()} for k, v in pii.items()}
 
+# --- NER PII ---
 def find_ner_pii(text, page_texts):
     doc = nlp(text)
     ner_pii = defaultdict(lambda: defaultdict(list))
@@ -73,6 +92,7 @@ def find_ner_pii(text, page_texts):
             ner_pii[ent.label_][value].append((context, page_number))
     return {k: {vk: list(set(vv)) for vk, vv in v.items()} for k, v in ner_pii.items()}
 
+# --- DOCX redaction ---
 def redact_docx(file, approved):
     doc = Document(file)
     for p in doc.paragraphs:
@@ -84,7 +104,11 @@ def redact_docx(file, approved):
     buffer.seek(0)
     return buffer
 
+# --- PDF redaction ---
 def redact_pdf(file, approved):
+    if not pdf_enabled:
+        st.error("PDF redaction disabled (PyMuPDF not installed).")
+        return None
     doc = fitz.open(stream=file.read(), filetype="pdf")
     for value in approved:
         for page in doc:
@@ -98,50 +122,55 @@ def redact_pdf(file, approved):
     doc.close()
     return buffer
 
-st.title("PII Redactor with Auto-Select")
+# --- Streamlit interface ---
+st.title("PII Redactor with Auto-Select All")
 
-uploaded_file = st.file_uploader("Upload PDF or DOCX", type=['pdf', 'docx'])
+file_types = ["docx"]
+if pdf_enabled:
+    file_types.append("pdf")
+
+uploaded_file = st.file_uploader("Upload PDF or DOCX", type=file_types)
 
 if uploaded_file:
     text, page_texts = extract_text(uploaded_file)
-    regex_pii = find_regex_pii(text, page_texts)
-    ner_pii = find_ner_pii(text, page_texts)
+    if text is not None:
+        regex_pii = find_regex_pii(text, page_texts)
+        ner_pii = find_ner_pii(text, page_texts)
 
-    # Merge regex and NER PII
-    pii_groups = {}
-    all_types = set(list(regex_pii.keys()) + list(ner_pii.keys()))
-    for t in all_types:
-        pii_groups[t] = {}
-        if t in regex_pii:
-            pii_groups[t].update(regex_pii[t])
-        if t in ner_pii:
-            for vk, vv in ner_pii[t].items():
-                if vk in pii_groups[t]:
-                    pii_groups[t][vk].extend(vv)
-                    pii_groups[t][vk] = list(set(vv))
-                else:
-                    pii_groups[t][vk] = vv
+        # Merge regex and NER
+        pii_groups = {}
+        all_types = set(list(regex_pii.keys()) + list(ner_pii.keys()))
+        for t in all_types:
+            pii_groups[t] = {}
+            if t in regex_pii:
+                pii_groups[t].update(regex_pii[t])
+            if t in ner_pii:
+                for vk, vv in ner_pii[t].items():
+                    if vk in pii_groups[t]:
+                        pii_groups[t][vk].extend(vv)
+                        pii_groups[t][vk] = list(set(vv))
+                    else:
+                        pii_groups[t][vk] = vv
 
-    st.header("Select PII to Redact (All occurrences auto-selected)")
-    approved = []
-    check_states = {}
+        st.header("Select PII to Redact (All occurrences auto-selected)")
+        approved = []
 
-    for pii_type, values in pii_groups.items():
-        with st.expander(pii_type):
-            for value, contexts in values.items():
-                # Create a single string of all contexts for display
-                context_text = " | ".join([f"{ctx} (Page {pg})" for ctx, pg in contexts])
-                check_states[value] = st.checkbox(f"{value} → {context_text}", key=value)
-                if check_states[value]:
-                    approved.append(value)
+        for pii_type, values in pii_groups.items():
+            with st.expander(pii_type):
+                for value, contexts in values.items():
+                    context_text = " | ".join([f"{ctx} (Page {pg})" for ctx, pg in contexts])
+                    if st.checkbox(f"{value} → {context_text}", key=value):
+                        approved.append(value)
 
-    if st.button("Apply Redactions"):
-        ext = os.path.splitext(uploaded_file.name)[1].lower()
-        if ext == '.pdf':
+        if st.button("Apply Redactions"):
+            ext = os.path.splitext(uploaded_file.name)[1].lower()
             uploaded_file.seek(0)
-            redacted_file = redact_pdf(uploaded_file, approved)
-            st.download_button("Download Redacted PDF", redacted_file, file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_redacted.pdf")
-        elif ext == '.docx':
-            uploaded_file.seek(0)
-            redacted_file = redact_docx(uploaded_file, approved)
-            st.download_button("Download Redacted DOCX", redacted_file, file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_redacted.docx")
+            if ext == '.pdf':
+                redacted_file = redact_pdf(uploaded_file, approved)
+                if redacted_file:
+                    st.download_button("Download Redacted PDF", redacted_file,
+                                       file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_redacted.pdf")
+            elif ext == '.docx':
+                redacted_file = redact_docx(uploaded_file, approved)
+                st.download_button("Download Redacted DOCX", redacted_file,
+                                   file_name=f"{uploaded_file.name.rsplit('.',1)[0]}_redacted.docx")
